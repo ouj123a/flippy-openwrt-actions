@@ -29,6 +29,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Slim the rootfs (whitelist + dependency closure)
+        env:
+          PROFILE: ${{ inputs.profile }}
         run: |
           set -eux
           curl -fsSL -o rf.tar.gz "https://github.com/ophub/flippy-openwrt-actions/releases/download/OpenWrt_armv8_rootfs/2026.02.20-openwrt-armsr-armv8-generic-rootfs.tar.gz"
@@ -70,6 +72,12 @@ jobs:
           curl wget-ssl bash ipset iptables nftables openssl-util ethtool
           ca-bundle ca-certificates libustream-openssl libopenssl3
           coreutils-base64 coreutils-nohup coreutils-realpath coreutils-split coreutils-timeout openssh-keygen xz tc-tiny ruby unzip""".split()) & names
+
+          profile = os.environ.get("PROFILE", "slim")
+          if profile == "slim-docker":
+              dk = set(p for p in names if p.startswith(("docker", "containerd", "runc", "libnetwork", "tini", "luci-lib-docker")) or "dockerman" in p)
+              seeds |= dk
+              print("docker 保留:", sorted(dk))
 
           for svc in ["network", "dnsmasq", "firewall", "odhcpd", "sshd", "uhttpd", "samba4", "rpcd", "fstab", "boot", "system", "log"]:
               seeds |= owners("/etc/init.d/" + svc) & names
