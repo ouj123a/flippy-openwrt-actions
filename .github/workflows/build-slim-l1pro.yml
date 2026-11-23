@@ -43,7 +43,7 @@ jobs:
               if line.startswith("Package:"):
                   cur = line.split(":", 1)[1].strip(); pkgs.setdefault(cur, [])
               elif line.startswith("Depends:") and cur:
-                  pkgs[cur] = [re.sub(r"[<>=() ].*", "", d).strip() for d in line.split(":", 1)[1].split(",") if d.strip()]
+                  pkgs[cur] = [re.split(r"[<>=(]", d)[0].strip() for d in line.split(":", 1)[1].split(",") if d.strip()]
           names = set(pkgs)
 
           lists = {}
@@ -159,7 +159,7 @@ jobs:
                   seen += 1
               return os.path.exists(fp)
 
-          must = ["bin/busybox", "sbin/procd", "sbin/ubusd", "sbin/kmodloader", "sbin/ip", "bin/opkg", "usr/bin/jshn",
+          must = ["lib/ld-musl-aarch64.so.1", "lib/libc.so", "bin/busybox", "sbin/procd", "sbin/ubusd", "sbin/kmodloader", "sbin/ip", "bin/opkg", "usr/bin/jshn",
                   "usr/share/libubox/jshn.sh", "usr/bin/lua", "usr/bin/ucode", "usr/sbin/blkid", "usr/sbin/dnsmasq",
                   "usr/sbin/uhttpd", "usr/sbin/sshd", "usr/sbin/iptables", "etc/init.d/network", "etc/init.d/firewall",
                   "etc/init.d/dnsmasq", "etc/init.d/odhcpd", "usr/lib/lua/luci/controller", "usr/sbin/smbd", "bin/bash",
