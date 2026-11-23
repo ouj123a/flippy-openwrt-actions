@@ -49,6 +49,7 @@ jobs:
         uses: ophub/flippy-openwrt-actions@main
         env:
           OPENWRT_ARMSR: slim-rootfs.tar.gz
+          SAVE_OPENWRT_ROOTFS: "false"
           PACKAGE_SOC: l1pro
           CUSTOMIZE_RK3399: none
           KERNEL_REPO_URL: ophub/kernel
