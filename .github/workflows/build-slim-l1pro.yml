@@ -28,28 +28,119 @@ jobs:
     if: ${{ github.event.repository.owner.id == github.event.sender.id }}
     steps:
       - uses: actions/checkout@v6
-      - name: Slim the rootfs
+      - name: Slim the rootfs (whitelist + dependency closure)
         run: |
           set -eux
           curl -fsSL -o rf.tar.gz "https://github.com/ophub/flippy-openwrt-actions/releases/download/OpenWrt_armv8_rootfs/2026.02.20-openwrt-armsr-armv8-generic-rootfs.tar.gz"
           mkdir -p rf && tar -xzf rf.tar.gz -C rf
-          # 保留: LuCI 基础 / 文件共享 (luci-app-samba4 + samba4) / OpenClash (luci-app-openclash)
-          DROP="openlist rclone verysync sing-box xray-core v2ray-plugin gost hysteria mosdns frps frpc kcptun-client ddns-go dnsproxy npc lucky netdata node luci-app-passwall luci-app-mosdns luci-app-dockerman"
-          if [ "${{ inputs.profile }}" = "slim" ]; then DROP="$DROP docker dockerd docker-compose containerd"; fi
-          for p in $DROP; do
-            lst="rf/usr/lib/opkg/info/$p.list"
-            if [ -f "$lst" ]; then
-              sed 's|^/|rf/|' "$lst" | tr '\n' '\0' | xargs -0 -r rm -rf
-              rm -f "rf/usr/lib/opkg/info/$p".*
-              awk -v pkg="$p" 'BEGIN{RS="\n\n"} $0 ~ "^Package: "pkg"$" {next} {print $0"\n"}' rf/usr/lib/opkg/status > rf/usr/lib/opkg/status.new || true
-              mv rf/usr/lib/opkg/status.new rf/usr/lib/opkg/status
-            fi
-          done
-          # 固件指纹：刷机后能一眼确认是否真的跑的是这一版
+          python3 - <<'PY'
+          import os, re, sys, glob
+
+          root = "rf"
+          info = os.path.join(root, "usr/lib/opkg/info")
+          pkgs, cur = {}, None
+          for line in open(os.path.join(root, "usr/lib/opkg/status"), encoding="utf-8", errors="ignore"):
+              if line.startswith("Package:"):
+                  cur = line.split(":", 1)[1].strip(); pkgs.setdefault(cur, [])
+              elif line.startswith("Depends:") and cur:
+                  pkgs[cur] = [re.sub(r"[<>=() ].*", "", d).strip() for d in line.split(":", 1)[1].split(",") if d.strip()]
+          names = set(pkgs)
+
+          def owner_of(path):
+              out = []
+              for lf in glob.glob(info + "/*.list"):
+                  with open(lf, encoding="utf-8", errors="ignore") as f:
+                      for ln in f:
+                          if ln.strip() == path:
+                              out.append(os.path.basename(lf)[:-5]); break
+              return out
+
+          seeds = set("""busybox base-files kernel procd uci ubus libubox netifd fstools block-mount opkg
+          dnsmasq-full firewall odhcpd-ipv6only openssh-server uhttpd rpcd logd
+          luci-base luci-i18n-base-zh-cn luci-mod-admin-full luci-mod-network luci-mod-status luci-mod-system luci-theme-bootstrap
+          luci-app-openclash luci-app-samba4 samba4-server samba4-libs
+          curl wget-ssl bash ipset iptables nftables
+          ca-bundle ca-certificates libustream-openssl libopenssl3""".split()) & names
+
+          for svc in ["network", "dnsmasq", "firewall", "odhcpd", "sshd", "uhttpd", "samba4", "rpcd", "fstab", "boot", "system", "log"]:
+              seeds |= set(owner_of("/etc/init.d/" + svc)) & names
+
+          keep = set(p for p in names if p.startswith("kmod-")) | seeds
+          changed = True
+          while changed:
+              changed = False
+              for p in list(keep):
+                  for dep in pkgs.get(p, []):
+                      if dep in names and dep not in keep:
+                          keep.add(dep); changed = True
+          while True:
+              need = seeds | set(p for p in keep if p.startswith("kmod-"))
+              for p in keep:
+                  need |= set(d for d in pkgs.get(p, []) if d in keep)
+              if need == keep:
+                  break
+              keep = need
+
+          drop = sorted(names - keep)
+          for p in drop:
+              lf = os.path.join(info, p + ".list")
+              if os.path.exists(lf):
+                  for f in open(lf, encoding="utf-8", errors="ignore"):
+                      f = f.strip()
+                      if not f:
+                          continue
+                      fp = root + f
+                      try:
+                          if os.path.islink(fp) or os.path.isfile(fp):
+                              os.unlink(fp)
+                      except OSError:
+                          pass
+                  os.unlink(lf)
+              for ext in [".control", ".md5sum", ".postinst", ".prerm", ".conffiles", ".preinst", ".postrm", ".version", ".depends"]:
+                  f2 = os.path.join(info, p + ext)
+                  if os.path.exists(f2):
+                      os.unlink(f2)
+
+          rmd = os.path.join(root, "etc/rc.d")
+          if os.path.isdir(rmd):
+              for s in os.listdir(rmd):
+                  p = os.path.join(rmd, s)
+                  if os.path.islink(p):
+                      tgt = os.readlink(p)
+                      tgt = tgt if os.path.isabs(tgt) else os.path.join(rmd, tgt)
+                      if not os.path.exists(root + tgt) and not os.path.exists(tgt):
+                          os.unlink(p)
+
+          must = ["bin/busybox", "sbin/procd", "sbin/netifd", "bin/opkg", "usr/sbin/dnsmasq", "usr/sbin/uhttpd",
+                  "usr/sbin/sshd", "usr/sbin/iptables", "etc/init.d/network", "etc/init.d/firewall",
+                  "etc/init.d/dnsmasq", "etc/init.d/odhcpd", "usr/lib/lua/luci/controller"]
+          miss = [m for m in must if not os.path.exists(os.path.join(root, m))]
+          print("kept pkgs: %d   dropped pkgs: %d" % (len(keep), len(drop)))
+          print("missing critical files: %s" % (miss if miss else "none"))
+          if miss:
+              sys.exit(1)
+          PY
+          if [ "${{ inputs.profile }}" = "slim" ]; then
+            python3 - <<'PY'
+          import os
+          root = "rf"; info = os.path.join(root, "usr/lib/opkg/info")
+          for p in ["docker", "dockerd", "docker-compose", "containerd"]:
+              lf = os.path.join(info, p + ".list")
+              if os.path.exists(lf):
+                  for f in open(lf, encoding="utf-8", errors="ignore"):
+                      fp = root + f.strip()
+                      if f.strip():
+                          try:
+                              if os.path.islink(fp) or os.path.isfile(fp):
+                                  os.unlink(fp)
+                          except OSError:
+                              pass
+                  os.unlink(lf)
+          print("docker cleaned")
+          PY
+          fi
           printf 'l1pro-slim OpenClash+Samba build %s\n' "$(date -u +%Y.%m.%d-%H%MUTC)" > rf/etc/slim-mark
-          sed -i "s/^.*option hostname.*$/\toption hostname 'l1pro-slim'/" rf/etc/config/system || true
-          echo "已删包: $DROP"
-          echo "剩余已装包数量: $(ls rf/usr/lib/opkg/info/*.list | wc -l)"
+          echo "remaining pkgs: $(ls rf/usr/lib/opkg/info/*.list | wc -l)"
           du -sh rf
           tar --owner=0 --group=0 --numeric-owner -czf slim-rootfs.tar.gz -C rf .
           ls -lh slim-rootfs.tar.gz
