@@ -33,7 +33,8 @@ jobs:
           set -eux
           curl -fsSL -o rf.tar.gz "https://github.com/ophub/flippy-openwrt-actions/releases/download/OpenWrt_armv8_rootfs/2026.02.20-openwrt-armsr-armv8-generic-rootfs.tar.gz"
           mkdir -p rf && tar -xzf rf.tar.gz -C rf
-          DROP="openlist rclone verysync sing-box xray-core v2ray-plugin gost hysteria mosdns frps frpc kcptun-client ddns-go dnsproxy npc lucky netdata node luci-app-openclash luci-app-passwall luci-app-mosdns luci-app-dockerman"
+          # 保留: LuCI 基础 / 文件共享 (luci-app-samba4 + samba4) / OpenClash (luci-app-openclash)
+          DROP="openlist rclone verysync sing-box xray-core v2ray-plugin gost hysteria mosdns frps frpc kcptun-client ddns-go dnsproxy npc lucky netdata node luci-app-passwall luci-app-mosdns luci-app-dockerman"
           if [ "${{ inputs.profile }}" = "slim" ]; then DROP="$DROP docker dockerd docker-compose containerd"; fi
           for p in $DROP; do
             lst="rf/usr/lib/opkg/info/$p.list"
