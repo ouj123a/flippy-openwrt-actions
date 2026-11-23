@@ -36,7 +36,7 @@ jobs:
           python3 - <<'PY'
           import os, re, sys, glob
 
-          root = "rf"
+          root = sys.argv[1] if len(sys.argv) > 1 else "rf"
           info = os.path.join(root, "usr/lib/opkg/info")
           pkgs, cur = {}, None
           for line in open(os.path.join(root, "usr/lib/opkg/status"), encoding="utf-8", errors="ignore"):
@@ -46,57 +46,96 @@ jobs:
                   pkgs[cur] = [re.sub(r"[<>=() ].*", "", d).strip() for d in line.split(":", 1)[1].split(",") if d.strip()]
           names = set(pkgs)
 
-          def owner_of(path):
-              out = []
-              for lf in glob.glob(info + "/*.list"):
-                  with open(lf, encoding="utf-8", errors="ignore") as f:
-                      for ln in f:
-                          if ln.strip() == path:
-                              out.append(os.path.basename(lf)[:-5]); break
-              return out
+          lists = {}
+          for lf in glob.glob(info + "/*.list"):
+              pkg = os.path.basename(lf)[:-5]
+              try:
+                  lists[pkg] = [ln.strip() for ln in open(lf, encoding="utf-8", errors="ignore") if ln.strip()]
+              except Exception:
+                  lists[pkg] = []
 
-          seeds = set("""busybox base-files kernel procd uci ubus libubox netifd fstools block-mount opkg
-          dnsmasq-full firewall odhcpd-ipv6only openssh-server uhttpd rpcd logd
+          owner_index = {}
+          for pkg, paths in lists.items():
+              for p in paths:
+                  owner_index.setdefault(p, set()).add(pkg)
+
+          def owners(path):
+              return owner_index.get(path, set())
+
+          seeds = set("""busybox base-files kernel procd uci ubus ubusd jshn jsonfilter libubox libubus libuci netifd fstools
+          block-mount blkid btrfs-progs lua ucode ubox opkg ip-full
+          dnsmasq-full firewall odhcpd-ipv6only openssh-server openssh-client uhttpd rpcd logd
           luci-base luci-i18n-base-zh-cn luci-mod-admin-full luci-mod-network luci-mod-status luci-mod-system luci-theme-bootstrap
           luci-app-openclash luci-app-samba4 samba4-server samba4-libs
-          curl wget-ssl bash ipset iptables nftables
-          ca-bundle ca-certificates libustream-openssl libopenssl3""".split()) & names
+          curl wget-ssl bash ipset iptables nftables openssl-util ethtool
+          ca-bundle ca-certificates libustream-openssl libopenssl3
+          coreutils-base64 coreutils-nohup coreutils-realpath coreutils-split coreutils-timeout openssh-keygen xz tc-tiny ruby unzip""".split()) & names
 
           for svc in ["network", "dnsmasq", "firewall", "odhcpd", "sshd", "uhttpd", "samba4", "rpcd", "fstab", "boot", "system", "log"]:
-              seeds |= set(owner_of("/etc/init.d/" + svc)) & names
+              seeds |= owners("/etc/init.d/" + svc) & names
 
           keep = set(p for p in names if p.startswith("kmod-")) | seeds
-          changed = True
-          while changed:
-              changed = False
-              for p in list(keep):
-                  for dep in pkgs.get(p, []):
-                      if dep in names and dep not in keep:
-                          keep.add(dep); changed = True
-          while True:
-              need = seeds | set(p for p in keep if p.startswith("kmod-"))
+
+          def closure(k):
+              changed = True
+              while changed:
+                  changed = False
+                  for p in list(k):
+                      for dep in pkgs.get(p, []):
+                          if dep in names and dep not in k:
+                              k.add(dep); changed = True
+              while True:
+                  need = set(p for p in k if p.startswith("kmod-"))
+                  for p in k:
+                      need |= set(d for d in pkgs.get(p, []) if d in k)
+                  # seeds 永远保留
+                  need |= (seeds & names)
+                  if need == k:
+                      break
+                  k = need
+              return k
+
+          keep = closure(keep)
+
+          # 迭代：保留包里的符号链接目标，其提供者也要保留
+          for _ in range(6):
+              added = False
+              prot = set()
               for p in keep:
-                  need |= set(d for d in pkgs.get(p, []) if d in keep)
-              if need == keep:
+                  prot |= set(lists.get(p, []))
+              for p in prot:
+                  fp = os.path.join(root, p.lstrip('/'))
+                  if os.path.islink(fp):
+                      t = os.readlink(fp)
+                      tgt = t if os.path.isabs(t) else os.path.normpath(os.path.join(os.path.dirname(p), t))
+                      tw = os.path.join(root, tgt.lstrip('/'))
+                      if not os.path.exists(tw):
+                          continue
+                      for o in owners(tgt):
+                          if o not in keep:
+                              keep.add(o); seeds.add(o); added = True
+              keep = closure(keep)
+              if not added:
                   break
-              keep = need
+
+          protected = set()
+          for p in keep:
+              protected |= set(lists.get(p, []))
 
           drop = sorted(names - keep)
+          skipped = 0
           for p in drop:
-              lf = os.path.join(info, p + ".list")
-              if os.path.exists(lf):
-                  for f in open(lf, encoding="utf-8", errors="ignore"):
-                      f = f.strip()
-                      if not f:
-                          continue
-                      fp = root + f
-                      try:
-                          if os.path.islink(fp) or os.path.isfile(fp):
-                              os.unlink(fp)
-                      except OSError:
-                          pass
-                  os.unlink(lf)
-              for ext in [".control", ".md5sum", ".postinst", ".prerm", ".conffiles", ".preinst", ".postrm", ".version", ".depends"]:
+              for f in lists.get(p, []):
+                  if f in protected:
+                      skipped += 1
+                      continue
+                  fp = root + f
+                  try:
+                      if os.path.islink(fp) or os.path.isfile(fp):
+                          os.unlink(fp)
+                  except OSError:
+                      pass
+              for ext in [".list", ".control", ".md5sum", ".postinst", ".prerm", ".conffiles", ".preinst", ".postrm", ".version", ".depends"]:
                   f2 = os.path.join(info, p + ext)
                   if os.path.exists(f2):
                       os.unlink(f2)
@@ -111,20 +150,34 @@ jobs:
                       if not os.path.exists(root + tgt) and not os.path.exists(tgt):
                           os.unlink(p)
 
-          must = ["bin/busybox", "sbin/procd", "sbin/netifd", "bin/opkg", "usr/sbin/dnsmasq", "usr/sbin/uhttpd",
-                  "usr/sbin/sshd", "usr/sbin/iptables", "etc/init.d/network", "etc/init.d/firewall",
-                  "etc/init.d/dnsmasq", "etc/init.d/odhcpd", "usr/lib/lua/luci/controller"]
-          miss = [m for m in must if not os.path.exists(os.path.join(root, m))]
-          print("kept pkgs: %d   dropped pkgs: %d" % (len(keep), len(drop)))
+          def exists_in_root(rel):
+              fp = os.path.join(root, rel)
+              seen = 0
+              while os.path.islink(fp) and seen < 10:
+                  t = os.readlink(fp)
+                  fp = os.path.normpath(os.path.join(root, t.lstrip("/")) if os.path.isabs(t) else os.path.join(os.path.dirname(fp), t))
+                  seen += 1
+              return os.path.exists(fp)
+
+          must = ["bin/busybox", "sbin/procd", "sbin/ubusd", "sbin/kmodloader", "sbin/ip", "bin/opkg", "usr/bin/jshn",
+                  "usr/share/libubox/jshn.sh", "usr/bin/lua", "usr/bin/ucode", "usr/sbin/blkid", "usr/sbin/dnsmasq",
+                  "usr/sbin/uhttpd", "usr/sbin/sshd", "usr/sbin/iptables", "etc/init.d/network", "etc/init.d/firewall",
+                  "etc/init.d/dnsmasq", "etc/init.d/odhcpd", "usr/lib/lua/luci/controller", "usr/sbin/smbd", "bin/bash",
+                  "usr/bin/curl", "usr/bin/awk", "bin/gzip", "bin/tar"]
+          miss = [m for m in must if not exists_in_root(m)]
+          print("kept pkgs: %d   dropped pkgs: %d   shared-paths skipped: %d" % (len(keep), len(drop), skipped))
           print("missing critical files: %s" % (miss if miss else "none"))
           if miss:
               sys.exit(1)
           PY
+          rm -f rf/usr/lib/lua/luci/controller/admin/filebrowser.lua
+          find rf/usr/lib/lua/luci/controller rf/usr/lib/lua/luci/view -mindepth 1 -type d -empty -delete 2>/dev/null || true
           if [ "${{ inputs.profile }}" = "slim" ]; then
             python3 - <<'PY'
           import os
           root = "rf"; info = os.path.join(root, "usr/lib/opkg/info")
-          for p in ["docker", "dockerd", "docker-compose", "containerd"]:
+          extra = ["docker", "dockerd", "docker-compose", "containerd"]
+          for p in extra:
               lf = os.path.join(info, p + ".list")
               if os.path.exists(lf):
                   for f in open(lf, encoding="utf-8", errors="ignore"):
@@ -140,7 +193,8 @@ jobs:
           PY
           fi
           printf 'l1pro-slim OpenClash+Samba build %s\n' "$(date -u +%Y.%m.%d-%H%MUTC)" > rf/etc/slim-mark
-          echo "remaining pkgs: $(ls rf/usr/lib/opkg/info/*.list | wc -l)"
+          sed -i "s/^.*option hostname.*$/\toption hostname 'l1pro-slim'/" rf/etc/config/system || true
+          echo "剩余包: $(ls rf/usr/lib/opkg/info/*.list | wc -l)"
           du -sh rf
           tar --owner=0 --group=0 --numeric-owner -czf slim-rootfs.tar.gz -C rf .
           ls -lh slim-rootfs.tar.gz
