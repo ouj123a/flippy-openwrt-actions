@@ -2,15 +2,14 @@ name: Build slim OpenWrt for l1pro
 on:
   workflow_dispatch:
     inputs:
-      rootfs_source:
-        description: "rootfs: official / immortalwrt / flippy-full"
+      profile:
+        description: "slim = 去掉 docker / slim-docker = 保留 docker"
         required: false
-        default: "immortalwrt"
+        default: "slim"
         type: choice
         options:
-          - immortalwrt
-          - official
-          - flippy-full
+          - slim
+          - slim-docker
       openwrt_ip:
         description: "default LAN IP"
         required: false
@@ -29,19 +28,27 @@ jobs:
     if: ${{ github.event.repository.owner.id == github.event.sender.id }}
     steps:
       - uses: actions/checkout@v6
-      - name: Resolve rootfs url
-        id: rf
+      - name: Slim the rootfs
         run: |
-          case "${{ inputs.rootfs_source }}" in
-            immortalwrt) u="https://downloads.immortalwrt.org/releases/24.10.4/targets/armsr/armv8/immortalwrt-24.10.4-armsr-armv8-rootfs.tar.gz" ;;
-            flippy-full) u="https://github.com/ophub/flippy-openwrt-actions/releases/download/OpenWrt_armv8_rootfs/2026.02.20-openwrt-armsr-armv8-generic-rootfs.tar.gz" ;;
-            *) u="https://downloads.openwrt.org/releases/24.10.4/targets/armsr/armv8/openwrt-24.10.4-armsr-armv8-rootfs.tar.gz" ;;
-          esac
-          echo "url=$u" >> $GITHUB_OUTPUT
+          set -eux
+          curl -fsSL -o rf.tar.gz "https://github.com/ophub/flippy-openwrt-actions/releases/download/OpenWrt_armv8_rootfs/2026.02.20-openwrt-armsr-armv8-generic-rootfs.tar.gz"
+          mkdir -p rf && tar -xzf rf.tar.gz -C rf
+          DROP="openlist rclone verysync sing-box xray-core v2ray-plugin gost hysteria mosdns frps frpc kcptun-client ddns-go dnsproxy npc lucky netdata node luci-app-openclash luci-app-passwall luci-app-mosdns luci-app-dockerman"
+          if [ "${{ inputs.profile }}" = "slim" ]; then DROP="$DROP docker dockerd docker-compose containerd"; fi
+          for p in $DROP; do
+            lst="rf/usr/lib/opkg/info/$p.list"
+            if [ -f "$lst" ]; then
+              sed 's|^/|rf/|' "$lst" | tr '\n' '\0' | xargs -0 -r rm -rf
+              rm -f "rf/usr/lib/opkg/info/$p".*
+            fi
+          done
+          du -sh rf
+          tar --owner=0 --group=0 --numeric-owner -czf slim-rootfs.tar.gz -C rf .
+          ls -lh slim-rootfs.tar.gz
       - name: Package OpenWrt Firmware
         uses: ophub/flippy-openwrt-actions@main
         env:
-          OPENWRT_ARMSR: ${{ steps.rf.outputs.url }}
+          OPENWRT_ARMSR: slim-rootfs.tar.gz
           PACKAGE_SOC: l1pro
           CUSTOMIZE_RK3399: none
           KERNEL_REPO_URL: ophub/kernel
@@ -54,7 +61,7 @@ jobs:
         if: ${{ env.PACKAGED_STATUS == 'success' }}
         uses: actions/upload-artifact@v4
         with:
-          name: slim-l1pro-${{ inputs.rootfs_source }}-${{ env.PACKAGED_OUTPUTDATE }}
+          name: slim-l1pro-${{ inputs.profile }}-${{ env.PACKAGED_OUTPUTDATE }}
           path: ${{ env.PACKAGED_OUTPUTPATH }}/*
           if-no-files-found: error
           compression-level: 0
