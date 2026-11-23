@@ -41,8 +41,15 @@ jobs:
             if [ -f "$lst" ]; then
               sed 's|^/|rf/|' "$lst" | tr '\n' '\0' | xargs -0 -r rm -rf
               rm -f "rf/usr/lib/opkg/info/$p".*
+              awk -v pkg="$p" 'BEGIN{RS="\n\n"} $0 ~ "^Package: "pkg"$" {next} {print $0"\n"}' rf/usr/lib/opkg/status > rf/usr/lib/opkg/status.new || true
+              mv rf/usr/lib/opkg/status.new rf/usr/lib/opkg/status
             fi
           done
+          # 固件指纹：刷机后能一眼确认是否真的跑的是这一版
+          printf 'l1pro-slim OpenClash+Samba build %s\n' "$(date -u +%Y.%m.%d-%H%MUTC)" > rf/etc/slim-mark
+          sed -i "s/^.*option hostname.*$/\toption hostname 'l1pro-slim'/" rf/etc/config/system || true
+          echo "已删包: $DROP"
+          echo "剩余已装包数量: $(ls rf/usr/lib/opkg/info/*.list | wc -l)"
           du -sh rf
           tar --owner=0 --group=0 --numeric-owner -czf slim-rootfs.tar.gz -C rf .
           ls -lh slim-rootfs.tar.gz
