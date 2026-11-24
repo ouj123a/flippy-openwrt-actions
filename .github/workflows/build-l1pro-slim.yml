@@ -1,0 +1,239 @@
+#================================================================================
+# 我家云 L1Pro（RK3328）精简固件 · 全自动编译 + 打包
+# 流程：GitHub Actions 现场编译一份「只含 上网/Docker/OpenClash」的
+#      armsr-armv8 rootfs.tar.gz → 交给 ophub/flippy-openwrt-actions 打包成
+#      可线刷的 openwrt_rk3328_l1pro_*.img → 上传到本仓库 Releases
+# 触发：Actions 页面 → Select workflow → Run workflow（可改参数）
+#================================================================================
+name: 精简编译打包 l1pro (源码法)
+
+on:
+  workflow_dispatch:
+    inputs:
+      openwrt_repo:
+        description: "OpenWrt 源码仓库（owner/repo）"
+        required: false
+        default: "immortalwrt/immortalwrt"
+        type: choice
+        options:
+          - immortalwrt/immortalwrt
+          - openwrt/openwrt
+          - coolsnowwolf/lede
+      openwrt_branch:
+        description: "源码分支（ImmortalWrt/lede 用 master；OpenWrt 官方用 main 或 stable-24.10）"
+        required: true
+        default: "master"
+        type: string
+      flippy_kernel:
+        description: "Flippy 内核版本（RK3328 建议 6.12.y，求稳可选 6.1.y）"
+        required: false
+        default: "6.12.y"
+        type: choice
+        options:
+          - 6.12.y
+          - 6.1.y_6.12.y
+          - 6.6.y
+          - 6.18.y
+          - 5.15.y
+      openwrt_ip:
+        description: "固件默认 LAN IP（旁路由请改成与主路由同网段的空闲地址）"
+        required: false
+        default: "192.168.1.1"
+        type: string
+
+env:
+  TZ: Asia/Shanghai
+
+jobs:
+  #--------------------------------------------------------------------------
+  # Job 1：编译精简 rootfs
+  #--------------------------------------------------------------------------
+  build-rootfs:
+    runs-on: ubuntu-24.04
+    name: 编译 armsr-armv8 精简 rootfs
+    steps:
+      - name: 释放磁盘空间
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache 2>/dev/null || true
+          sudo docker image prune -a -f 2>/dev/null || true
+          df -Th
+
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang flex bison g++ gawk \
+            gcc-multilib g++-multilib gettext git libncurses-dev libssl-dev \
+            python3 python3-setuptools rsync swig unzip zlib1g-dev file wget \
+            libelf-dev bc ccache time
+
+      - name: 检出本仓库（读取 config/openwrt.config）
+        uses: actions/checkout@v4
+
+      - name: 拉取 OpenWrt 源码
+        run: |
+          if ! git clone --depth=1 -b ${{ inputs.openwrt_branch }} \
+              https://github.com/${{ inputs.openwrt_repo }}.git openwrt; then
+            echo "::warning::指定分支 ${{ inputs.openwrt_branch }} 不存在，改用仓库默认分支。"
+            echo "可用分支如下（下次可直接填）："
+            git ls-remote --heads https://github.com/${{ inputs.openwrt_repo }}.git | \
+              sed 's#.*refs/heads_##' | grep -E 'master|main|^[0-9]+\.[0-9]+|stable' | sort -u | head -30
+            git clone --depth=1 https://github.com/${{ inputs.openwrt_repo }}.git openwrt
+          fi
+          echo "实际使用分支: $(cd openwrt && git rev-parse --abbrev-ref HEAD)"
+
+      - name: 校验源码含 armsr 平台（打包 l1pro 的前提）
+        working-directory: openwrt
+        run: |
+          if [ ! -d target/linux/armsr ]; then
+            echo "::error::所选源码/分支没有 armsr 平台，无法产出 armsr-armv8 rootfs。"
+            echo "::error::请改用 ImmortalWrt(master) 或 OpenWrt 官方(main / stable-24.10)。"
+            exit 1
+          fi
+          echo "armsr 平台存在：$(ls target/linux/armsr)"
+
+      - name: 添加 OpenClash 第三方源
+        working-directory: openwrt
+        run: |
+          git clone --depth=1 -b master https://github.com/vernesong/OpenClash.git /tmp/openclash-src
+          # 自动定位名为 luci-app-openclash 的包目录，不依赖固定的仓库层级
+          pkgdir=$(find /tmp/openclash-src -maxdepth 3 -type d -name 'luci-app-openclash' | head -1)
+          [ -n "$pkgdir" ] || { echo "::error::OpenClash 仓库里没找到 luci-app-openclash 目录"; exit 1; }
+          mkdir -p package/feeds/openclash
+          cp -r "$pkgdir" package/feeds/openclash/
+          echo "已引入: $(ls package/feeds/openclash/luci-app-openclash | head -5)"
+
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a -p packages
+          ./scripts/feeds install -a -p luci
+
+          echo "===== 关键包检查 ====="
+          if [ -d package/feeds/openclash/luci-app-openclash ]; then
+            echo "FOUND  luci-app-openclash"
+          else
+            echo "WARN   luci-app-openclash 目录未就位，请核对 OpenClash 仓库结构"
+          fi
+          ls package/feeds/openclash/ 2>/dev/null || true
+
+      - name: 复制 config/openwrt.config 到 .config
+        working-directory: openwrt
+        run: |
+          cp "${{ github.workspace }}/config/openwrt.config" .config
+          echo "===== 采用配置 ====="; grep -vE '^\s*#|^\s*$' .config
+
+      - name: 生成完整依赖配置（defconfig）
+        working-directory: openwrt
+        run: |
+          make defconfig
+          echo "===== 关键包是否进入最终配置 ====="
+          for k in CONFIG_TARGET_armsr_armv8 CONFIG_PACKAGE_luci-app-openclash \
+                   CONFIG_PACKAGE_dockerd CONFIG_PACKAGE_luci CONFIG_PACKAGE_dnsmasq-full \
+                   CONFIG_TARGET_ROOTFS_TARGZ; do
+            grep "^${k}=y" .config >/dev/null && echo "OK   ${k}" || echo "WARN ${k} 未启用"
+          done
+
+      - name: 预下载工具链与源码包
+        working-directory: openwrt
+        run: make download -j8 V=s || make download -j1 V=s
+
+      - name: 编译固件
+        working-directory: openwrt
+        run: |
+          make -j$(($(nproc)+1)) || make -j1 V=s
+          echo "===== 编译产物 ====="
+          find bin/targets -type f -name '*.tar.gz' -exec ls -lh {} \;
+
+      - name: 定位 armsr-armv8 rootfs
+        working-directory: openwrt
+        run: |
+          rootfs=$(find bin/targets -path '*armsr*' -name '*rootfs*.tar.gz' | head -1)
+          [ -n "$rootfs" ] || { echo "::error::未找到 armsr rootfs.tar.gz"; exit 1; }
+          echo "rootfs=$rootfs" | tee -a "$GITHUB_ENV"
+          ls -lh "$rootfs"
+
+      - name: 上传 rootfs 供打包 Job 使用
+        uses: actions/upload-artifact@v4
+        with:
+          name: armsr-armv8-rootfs
+          path: openwrt/${{ env.rootfs }}
+          retention-days: 3
+          if-no-files-found: error
+
+  #--------------------------------------------------------------------------
+  # Job 2：用 flippy-openwrt-actions 打包成 l1pro 可刷镜像
+  #--------------------------------------------------------------------------
+  pack-image:
+    needs: build-rootfs
+    # 与官方示例保持一致：flippy 打包脚本跑在 ARM runner 上
+    runs-on: ubuntu-26.04-arm
+    name: 打包 l1pro 固件（flippy-openwrt-actions）
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 取回精简 rootfs
+        uses: actions/download-artifact@v4
+        with:
+          name: armsr-armv8-rootfs
+          path: rootfs
+
+      - name: 整理路径（Action 需要仓库内相对路径）
+        run: |
+          mkdir -p openwrt/bin/targets/armsr/armv8
+          cp rootfs/*rootfs.tar.gz openwrt/bin/targets/armsr/armv8/
+          ls -lh openwrt/bin/targets/armsr/armv8/
+
+      - name: Package OpenWrt Firmware
+        uses: ophub/flippy-openwrt-actions@main
+        env:
+          # 精简 rootfs 来源（本地相对路径）
+          OPENWRT_ARMSR: openwrt/bin/targets/armsr/armv8/*rootfs.tar.gz
+          # 我家云 L1Pro = l1pro（rk3328）
+          PACKAGE_SOC: l1pro
+          KERNEL_REPO_URL: ophub/kernel
+          KERNEL_VERSION_NAME: ${{ inputs.flippy_kernel }}
+          KERNEL_AUTO_LATEST: true
+          OPENWRT_IP: ${{ inputs.openwrt_ip }}
+          GZIP_IMGS: .gz
+          WHOAMI: flippy
+          # 精简固件：关掉硬件加速与 WiFi 相关开关（我家云为有线单口、无 WiFi）
+          SW_FLOWOFFLOAD: 1
+          HW_FLOWOFFLOAD: 0
+          SFE_FLOW: 1
+          ENABLE_WIFI_K504: 0
+          ENABLE_WIFI_K510: 0
+
+      - name: 校验打包结果
+        if: env.PACKAGED_STATUS == 'success'
+        run: |
+          echo "打包输出目录: ${{ env.PACKAGED_OUTPUTPATH }}"
+          ls -lh ${{ env.PACKAGED_OUTPUTPATH }}
+
+      - name: 上传到 Releases
+        uses: softprops/action-gh-release@v2
+        if: env.PACKAGED_STATUS == 'success'
+        with:
+          tag_name: L1Pro_mini_${{ env.PACKAGED_OUTPUTDATE }}
+          name: 我家云 l1pro 精简固件（上网+Docker+OpenClash）
+          files: ${{ env.PACKAGED_OUTPUTPATH }}/*
+          body: |
+            适用设备：我家云 L1Pro / 粒子云（瑞芯微 RK3328，ARMv8 64 位）
+            SoC 代号：`l1pro` · 打包脚本：`mk_rk3328_l1pro.sh`
+
+            ### 固件信息
+            - 默认 IP：**${{ inputs.openwrt_ip }}**
+            - 默认账号 / 密码：`root` / `password`
+            - SSH 端口：22
+            - 内置：LuCI 后台、Docker（dockerd + Dockerman）、OpenClash
+            - 已裁掉：Samba、UPnP、DDNS、QoS、网速监控、广告屏蔽、虚拟化等
+            - Flippy 内核：${{ inputs.flippy_kernel }}（自动取同系列最新版）
+
+            ### 刷机（首次需拆机短接进入 MASKROM 线刷模式）
+            1. 解压本页面下载的 `openwrt_rk3328_l1pro_*.img.gz` 得到 `.img`
+            2. 装 RK 驱动 DriverAssistant，打开 AndroidTool（RKBatchTool）
+            3. 设备断电 → 短接主板 MASKROM/Recovery 触点 → 接 USB → 电脑识别「发现设备」
+            4. 「运行方式」选 eMMC，按 Ctrl+R 选择 `.img`，点击「执行」刷入
+            5. 断电重启，网线接路由器 LAN 口，浏览器访问默认 IP
+
+            > 若做旁路由：登录后把 LAN 设为与主路由同网段静态 IP、网关指向主路由、关闭 DHCP。
+            > OpenClash 内核（mihomo）默认需联网下载；若此时还没科学上网，请手动下载
+            > `clash-linux-armv8.tar.gz` 上传到 `/usr/share/openclash/` 后在插件里指定。
