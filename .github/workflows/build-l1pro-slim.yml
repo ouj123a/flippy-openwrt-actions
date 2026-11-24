@@ -20,7 +20,7 @@ on:
           - openwrt/openwrt
           - coolsnowwolf/lede
       openwrt_branch:
-        description: "源码分支（ImmortalWrt/lede 用 master；OpenWrt 官方用 main 或 stable-24.10）"
+        description: "源码分支。master 已实测全部包可用；稳定分支缺 ImmortalWrt 特有包"
         required: true
         default: "master"
         type: string
