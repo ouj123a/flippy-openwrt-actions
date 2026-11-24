@@ -1,0 +1,88 @@
+#================================================================================
+# 快照直打包 l1pro —— 不编译，直接用你当前系统的 rootfs 出可线刷镜像
+# 用途：把 192.168.10.111 上"现在的完整状态"（中文 + Docker + 已装 samba4 +
+#      全部运行配置）固化成固件。约 10 分钟出结果。
+# 前提：快照已作为 Release 资产存在（tag: L1Pro_snapshot_src）
+#================================================================================
+name: 快照直打包 l1pro (当前系统状态)
+
+on:
+  workflow_dispatch:
+    inputs:
+      rootfs_url:
+        description: "rootfs tar.gz 的下载地址"
+        required: true
+        type: string
+        default: "https://github.com/ouj123a/flippy-openwrt-actions/releases/download/L1Pro_snapshot_src/l1pro-snapshot-rootfs.tar.gz"
+      flippy_kernel:
+        description: "Flippy 内核版本（保持与现机一致的 6.12.y 最稳）"
+        required: false
+        default: "6.12.y"
+        type: choice
+        options:
+          - 6.12.y
+          - 6.18.y
+          - 6.1.y
+      openwrt_ip:
+        description: "固件默认 LAN IP"
+        required: false
+        default: "192.168.10.111"
+        type: string
+
+env:
+  TZ: Asia/Shanghai
+
+jobs:
+  pack:
+    runs-on: ubuntu-26.04-arm
+    name: 用快照打包 l1pro 镜像
+    steps:
+      - name: 下载快照 rootfs
+        run: |
+          mkdir -p opt/download
+          curl -fL --retry 3 "${{ inputs.rootfs_url }}" \
+            -o opt/download/snapshot-rootfs.tar.gz
+          ls -lh opt/download/
+          echo "=== 内容抽查 ==="
+          tar tzf opt/download/snapshot-rootfs.tar.gz | head -5
+          echo "成员总数: $(tar tzf opt/download/snapshot-rootfs.tar.gz | wc -l)"
+
+      - name: Package OpenWrt Firmware
+        uses: ophub/flippy-openwrt-actions@main
+        env:
+          OPENWRT_ARMSR: opt/download/snapshot-rootfs.tar.gz
+          PACKAGE_SOC: l1pro
+          KERNEL_REPO_URL: ophub/kernel
+          KERNEL_VERSION_NAME: ${{ inputs.flippy_kernel }}
+          KERNEL_AUTO_LATEST: true
+          OPENWRT_IP: ${{ inputs.openwrt_ip }}
+          GZIP_IMGS: .gz
+          SAVE_OPENWRT_ROOTFS: "false"
+
+      - name: 校验产物
+        if: env.PACKAGED_STATUS == 'success'
+        run: ls -lh ${{ env.PACKAGED_OUTPUTPATH }}
+
+      - name: 上传到 Releases
+        uses: softprops/action-gh-release@v2
+        if: env.PACKAGED_STATUS == 'success'
+        with:
+          tag_name: L1Pro_snapshot_${{ env.PACKAGED_OUTPUTDATE }}
+          name: 我家云 l1pro 快照固件（当前系统原样）
+          files: ${{ env.PACKAGED_OUTPUTPATH }}/*
+          body: |
+            由设备 192.168.10.111 的实时系统快照打包而来，包含：
+            - ImmortalWrt 精简 rootfs（上网 / Docker / OpenClash / 中文 / 已装 samba4 等包）
+            - 运行期配置：语言 zh_Hans、Docker 数据目录 /mnt/emmc/docker、
+              fstab 自动挂载 p3、网络与 SSH 设置
+            - Flippy 内核 ${{ inputs.flippy_kernel }}（自动取同系列最新）
+
+            ### 重刷后必须补做的一步
+            本镜像写入 eMMC 时会重建分区表，5.4G 的 Docker 分区（p3）分区项会消失。
+            按以下参数原样重建即可找回原数据（**切勿 mkfs**，数据块仍在）：
+            `parted -s /dev/mmcblk0 mkpart primary ext4 3966976s 15271500s`
+            然后重启，`mount /dev/mmcblk0p3 /mnt/emmc`。
+
+            ### 刷机
+            解压 .gz 得到 .img，拆机短接进 MASKROM，用 AndroidTool 线刷 eMMC。
+            默认 IP：${{ inputs.openwrt_ip }}
